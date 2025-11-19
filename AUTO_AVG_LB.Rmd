@@ -1,0 +1,322 @@
+---
+title: "AUTO AVERAGE ARIMAX MODEL - Adapted to the Flusight Challenge"
+author: "Victor Felix"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+This is a single automatic ARIMAX model for forecasting weekly hospitalizations in states in the U.S. for the 2025/2026 FluSight Challenge. The model fits on 104 weeks of logarithmic transformed influenza-related hospitalizations.  It uses 1-week-lag logarithmic transformed average hospitalizations across the U.S. states, without the forecasting state, as exogenous variable. It forecasts 0-3 weeks ahead and the forecasts are exponentiated before submission. Lastly, it saves a CSV files according to the FluSight competition standards.
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+!!!!!!!!!!!!!!!!!!!
+LOADING THE DATASET
+!!!!!!!!!!!!!!!!!!!
+```{r}
+# Load function
+source("auto_AVG_LB_FluSight.R", local = TRUE, chdir = TRUE)
+
+# Load packages
+library("tidyr")
+library("MMWRweek")
+library("data.table")
+library("caret")
+library("purrr")
+library("dplyr")
+library("tseries")
+library("gtools")
+library("forecast")
+library("scoringutils")
+library("covidHubUtils")
+library("parallel")
+library("future")
+library("listenv")
+library("epitools")
+library("readr")
+library("parallel")
+library("dplyr")
+```
+
+LOAD FLUSIGHT DATASET
+
+```{r}
+URL <- "https://data.cdc.gov/resource/mpgq-jmmr.csv?$limit=50000"
+preliminary_NHSN_data <- RSocrata::read.socrata(URL)
+last_updated <- gsub("-","",Sys.Date())
+
+# write so we keep the records
+write_csv(preliminary_NHSN_data, paste0(
+  "hospitalizations_data/Weekly_Hospital_Respiratory_Data__HRD__Metrics_by_Jurisdiction__National_Healthcare_Safety_Network__NHSN___Preliminary__", last_updated, ".csv")
+  )
+```
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+MANUAL APPROACH - NOT IN USE- 
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+```{r}
+
+#influenza_data <- read.csv("hospitalizations_data/Weekly_Hospital_Respiratory_Data_(HRD)_Metrics_by_Jurisdiction,_National_Healthcare_Safety_Network_(NHSN)_(Preliminary)_20251119.csv")
+
+# Convert dates and add epiweek
+#influenza_data$Week.Ending.Date <- #as.Date(influenza_data$Week.Ending.Date)
+#influenza_data$epiweek <- #MMWRweek(influenza_data$Week.Ending.Date)$MMWRweek
+
+# Select and rename columns, join with state codes
+#my_data <- influenza_data %>%
+#  select(target_end_date = Week.Ending.Date,
+#         abbreviation = Geographic.aggregation,
+#         cases = Total.Influenza.Admissions) %>%
+  
+#  left_join(state_codes, by = "abbreviation") %>% # Here we keep only states we want to forecast
+#  mutate(
+#    cases = replace_na(cases, 0),
+#    cases = gsub(",", "", cases),       # remove commas
+#    cases = as.numeric(cases),          # convert to numeric
+#    target_end_date = as.Date(target_end_date)
+#  )
+
+
+# Create list of dataframes by state, keeping only the last 105 rows each
+#states_to_forecast1 <- split(my_data, my_data$State) %>%
+#  lapply(function(df) {
+#    df <- df[order(df$target_end_date), ]
+#    tail(df, 105)
+#  })
+
+
+```
+
+GET FLUSIGHT STATES for forecasting
+
+```{r}
+# Correct URL to the raw CSV file
+locations_file <- "https://raw.githubusercontent.com/cdcepi/FluSight-forecast-hub/main/auxiliary-data/locations.csv"
+
+# Read the CSV from the internet
+state_codes <- read_csv(locations_file)
+state_codes<-state_codes[,1:3]
+names(state_codes) = c("abbreviation","location","State")
+
+states=state_codes$abbreviation[2:53] # removing US, which I add later summing 50 states
+```
+
+Create a list of dataframes with influenza hospitalizations by each state
+Remove cases for USA and Virgin Islands
+
+
+```{r}
+# Convert dates and add epiweek
+preliminary_NHSN_data$weekendingdate <- as.Date(preliminary_NHSN_data$weekendingdate)
+preliminary_NHSN_data$epiweek <- MMWRweek(preliminary_NHSN_data$weekendingdate)$MMWRweek
+
+# Select and rename columns, join with state codes
+my_data <- preliminary_NHSN_data %>%
+  select(target_end_date = weekendingdate, # date
+         abbreviation = jurisdiction, # states, DC and puerto rico
+         cases = totalconfflunewadm) %>% # total of new confirmed hosp
+  
+  left_join(state_codes, by = "abbreviation") %>% # Here we keep only states we want to forecast
+  mutate(
+    cases = replace_na(cases, 0),
+    cases = gsub(",", "", cases),       # remove commas
+    cases = as.numeric(cases),          # convert to numeric
+    target_end_date = as.Date(target_end_date)
+  )
+
+# Create list of dataframes by state, keeping only the last 105 rows each
+states_to_forecast <- split(my_data, my_data$State) %>%
+  lapply(function(df) {
+    df <- df[order(df$target_end_date), ]
+    tail(df, 105)
+  })
+```
+
+Get the last date as reference date. This is the forecast week 0.
+
+```{r}
+reference_date<-max(states_to_forecast[[1]][["target_end_date"]])
+```
+
+Plot influenza hospitalizations for visualization
+
+```{r}
+for (st in names(states_to_forecast)) {
+  df <- states_to_forecast[[st]]
+  plot(df$target_end_date, df$cases,
+       type = "l",            
+       main = st,
+       xlab = "Date",
+       ylab = "Influenza Admissions")
+}
+```
+
+Process forecasts for submission
+
+```{r}
+
+process_for_submission <- function(data, reference_date) {
+  data %>%
+    pivot_longer(
+      cols = -c(State, target_end_date),
+      names_to = "quantile",
+      values_to = "value"
+    ) %>%
+    select(State, target_end_date, quantile, value) %>%
+    arrange(State, target_end_date, quantile) %>%
+    mutate(
+      reference_date = reference_date,
+      target_end_date = target_end_date-7,
+      horizon = as.numeric(difftime(target_end_date, reference_date, units = "weeks")),
+      target = "wk inc flu hosp",
+      output_type = "quantile"
+    )%>%  
+    rename(output_type_id = quantile)  # Rename quantile column
+}
+
+```
+
+Forecast 1 week ahead
+
+```{r}
+# Forecast 1 Week ahead
+AUTO_AVG_week1_forecast_list <- mclapply(
+    states_to_forecast, ES_AVERAGE,
+    auto = TRUE, n_weeks_ahead = 1, # n_weeks_ahead =1 for 1 week ahead
+    list_of_states = states_to_forecast,
+    week_lag = 1, window = 104,
+    mc.cores = 1) %>% setNames(names(states_to_forecast))
+
+# bind rows and remove NAs
+# these NAs are expected, they are an artifact of the initial model setting but they are not included in the model results
+# they do not affect the forecasts
+AUTO_AVG_week1_forecast <- AUTO_AVG_week1_forecast_list %>%
+  bind_rows(.id = "State") %>%
+  drop_na()%>%
+  process_for_submission(reference_date)
+  
+```
+
+Forecast 2 weeks ahead
+
+```{r}
+# Forecast 2 Week ahead
+AUTO_AVG_week2_forecast_list <- mclapply(
+    states_to_forecast, ES_AVERAGE,
+    auto = TRUE, n_weeks_ahead = 2, # n_weeks_ahead =2 for 2 weeks ahead
+    list_of_states = states_to_forecast,
+    week_lag = 1, window = 104,
+    mc.cores = 1) %>% setNames(names(states_to_forecast))
+
+# bind rows and remove NAs
+# these NAs are expected, they are an artifact of the initial model setting but they are not included in the model results
+# they do not affect the forecasts
+AUTO_AVG_week2_forecast <- AUTO_AVG_week2_forecast_list %>%
+  bind_rows(.id = "State") %>%
+  drop_na()%>%
+  process_for_submission(reference_date)
+  
+```
+
+Forecast 3 weeks ahead
+
+```{r}
+# Forecast 3 weeks ahead
+AUTO_AVG_week3_forecast_list <- mclapply(
+    states_to_forecast, ES_AVERAGE,
+    auto = TRUE, n_weeks_ahead = 3, # n_weeks_ahead =3 for 3 weeks ahead
+    list_of_states = states_to_forecast,
+    week_lag = 1, window = 104,
+    mc.cores = 1) %>% setNames(names(states_to_forecast))
+
+# bind rows and remove NAs
+# these NAs are expected, they are an artifact of the initial model setting but they are not included in the model results
+# they do not affect the forecasts
+AUTO_AVG_week3_forecast <- AUTO_AVG_week3_forecast_list %>%
+  bind_rows(.id = "State") %>%
+  drop_na()%>%
+  process_for_submission(reference_date)
+  
+```
+
+Forecast 4 weeks ahead
+
+```{r}
+# Forecast 4 weeks ahead
+AUTO_AVG_week4_forecast_list <- mclapply(
+    states_to_forecast, ES_AVERAGE,
+    auto = TRUE, n_weeks_ahead = 4, # n_weeks_ahead =4 for 4 weeks ahead
+    list_of_states = states_to_forecast,
+    week_lag = 1, window = 104,
+    mc.cores = 1) %>% setNames(names(states_to_forecast))
+
+
+# bind rows and remove NAs
+# these NAs are expected, they are an artifact of the initial model setting but they are not included in the model results
+# they do not affect the forecasts
+AUTO_AVG_week4_forecast <- AUTO_AVG_week4_forecast_list %>%
+  bind_rows(.id = "State") %>%
+  drop_na()%>%
+  process_for_submission(reference_date)
+  
+```
+
+Combine all states forecasts from different horizons
+
+```{r}
+# Combine all horizons 
+states_forecasts <- rbind(AUTO_AVG_week1_forecast, 
+                   AUTO_AVG_week2_forecast, 
+                   AUTO_AVG_week3_forecast, 
+                   AUTO_AVG_week4_forecast)
+
+head(states_forecasts)
+```
+Add the states forecasts quantiles to forecast the whole US
+
+```{r}
+# Aggregate to USA level
+us_forecast <- states_forecasts %>%
+    group_by(target_end_date, reference_date, horizon, output_type_id, target) %>%
+    summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(State = "US", output_type = "quantile")
+
+
+head(us_forecast)
+```
+
+Bind states forecasts and US forecasts
+Remove States and abbreviation columns (for submission)
+
+```{r}
+submission_forecasts<- bind_rows(states_forecasts, us_forecast) %>%
+  left_join(state_codes, by = "State") %>%
+  select(-State, -abbreviation) # We don't need State or abbreviation, just location columns
+
+# Final dataset for submission
+head(submission_forecasts)
+```
+
+Write the CSV file with the correct date
+
+```{r}
+# extract the target_end_date for horizon 0
+date_for_filename <- submission_forecasts %>%
+  filter(horizon == 0) %>%
+  pull(target_end_date) %>%
+  unique()
+
+# convert to character (YYYY-MM-DD)
+date_string <- format(date_for_filename, "%Y-%m-%d")
+
+# create the file name automatically
+file_name <- paste0("UGA_auto_AVG_LB/", 
+                    date_string, 
+                    "-UGA_auto_AVG_LB.csv")
+# write CSV
+write_csv(submission_forecasts, file = file_name)
+```
+
