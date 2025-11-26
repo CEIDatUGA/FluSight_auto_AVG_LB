@@ -296,7 +296,8 @@ Remove States and abbreviation columns (for submission)
 ```{r}
 submission_forecasts<- bind_rows(states_forecasts, us_forecast) %>%
   left_join(state_codes, by = "State") %>%
-  select(-State, -abbreviation) # We don't need State or abbreviation, just location columns
+  select(-State, -abbreviation) %>%
+  mutate(output_type_id = sub("\\.?0+$", "", output_type_id))
 
 # Final dataset for submission
 head(submission_forecasts)
