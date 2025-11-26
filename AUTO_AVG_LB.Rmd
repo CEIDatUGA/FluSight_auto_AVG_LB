@@ -170,8 +170,8 @@ process_for_submission <- function(data, reference_date) {
     select(State, target_end_date, quantile, value) %>%
     arrange(State, target_end_date, quantile) %>%
     mutate(
-      reference_date = reference_date,
-      target_end_date = target_end_date-7,
+      reference_date = reference_date+7,
+      target_end_date = target_end_date,
       horizon = as.numeric(difftime(target_end_date, reference_date, units = "weeks")),
       target = "wk inc flu hosp",
       output_type = "quantile"
@@ -315,9 +315,9 @@ date_for_filename <- submission_forecasts %>%
 date_string <- format(date_for_filename, "%Y-%m-%d")
 
 # create the file name automatically
-file_name <- paste0("UGA_auto_AVG_LB/", 
+file_name <- paste0("UGA_CEID-auto_AVG_LB/", 
                     date_string, 
-                    "-UGA_auto_AVG_LB.csv")
+                    "-UGA_CEID-auto_AVG_LB.csv")
 # write CSV
 write_csv(submission_forecasts, file = file_name)
 ```
