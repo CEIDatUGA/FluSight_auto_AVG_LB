@@ -49,7 +49,7 @@ ES_AVERAGE<-function(current_state_tb, auto=FALSE, n_weeks_ahead=1, week_lag=1, 
     # Extract the date (name of the data frame) and the quantiles
     date <- as.Date(names(list_all_pred_quantiles[[1]][i]))
     quantiles <- t(list_all_pred_quantiles[[1]][[i]][2])
-    quantiles<-expm1(quantiles)
+    quantiles<-exp(quantiles)
     # Create a temporary data frame with the quantiles and date
     temp_df <- data.frame(date = date, quantiles)
     # Bind the temporary data frame to the final data frame
